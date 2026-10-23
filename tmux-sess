@@ -16,6 +16,8 @@ Usage: tmux-sess COMMAND [SESSION|DIRECTORY]
   list             Show known sessions, live Codex status and last hibernation.
   list --tsv       Tab-separated rows without headings (for scripts).
   list --names     Known session names only.
+  list --sort KEY  Sort by hibe (default, unavailable first, newest last),
+                   name (A-Z), status (running first), or codex (no first).
   wd DIRECTORY     Save the project parent directory for future new sessions.
   wd               Show the effective project parent directory.
   completion bash  Print Bash completion setup.
@@ -55,6 +57,12 @@ _tmux_sess_complete() {
     COMPREPLY=()
     if (( COMP_CWORD == 1 )); then
         candidates=(new hibe wake list wd completion --help)
+    elif [[ $action == list ]]; then
+        if [[ ${COMP_WORDS[COMP_CWORD-1]} == --sort ]]; then
+            candidates=(hibe name status codex)
+        else
+            candidates=(--sort --tsv --names --help)
+        fi
     elif (( COMP_CWORD == 2 )); then
         case $action in
             new|hibe|wake) mapfile -t candidates < <("$_tmux_sess_executable" __complete "$action" 2>/dev/null) ;;
@@ -78,8 +86,26 @@ complete -F _tmux_sess_complete tmux-sess ./tmux-sess "$_tmux_sess_executable"
 COMPLETION
     exit 0
 fi
+sort_by=hibe
+if [[ ${1-} == list ]]; then
+    list_format=
+    shift
+    while (($#)); do
+        case $1 in
+            --tsv|--names) list_format=$1; shift ;;
+            --sort)
+                [[ $# -ge 2 ]] || fail '--sort requires hibe, name, status, or codex'
+                sort_by=$2; shift 2 ;;
+            --sort=*) sort_by=${1#*=}; shift ;;
+            -h|--help) help; exit 0 ;;
+            *) fail "Unknown list option: $1" ;;
+        esac
+    done
+    [[ $sort_by == hibe || $sort_by == name || $sort_by == status || $sort_by == codex ]] || fail 'Sort must be hibe, name, status, or codex'
+    if [[ -n $list_format ]]; then set -- list "$list_format"; else set -- list; fi
+fi
 [[ ( $# == 1 && ( $1 == list || $1 == wd ) ) || ( $# == 2 && ( $1 == hibe || $1 == wake || $1 == new || $1 == wd || ( $1 == list && ( $2 == --tsv || $2 == --names ) ) || ( $1 == __complete && ( $2 == new || $2 == hibe || $2 == wake ) ) ) ) ]] || fail 'Use tmux-sess -h for usage.'
-for tool in tmux sha256sum flock mktemp date; do command -v "$tool" >/dev/null || fail "Missing command: $tool"; done
+for tool in tmux sha256sum flock mktemp date sort; do command -v "$tool" >/dev/null || fail "Missing command: $tool"; done
 mode=$1 name=${2-}
 root=${TMUX_SESS_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-sess}
 mkdir -p -- "$root"
@@ -89,6 +115,22 @@ dest=$root/$key
 exec 9>"$root/.lock"
 if [[ $mode == list || $mode == __complete ]]; then flock -s 9; else flock -x 9; fi
 stage= created= backup= piping= attach=0
+kill_session_safely() {
+    local target=$1 layout_state window zoomed
+    # tmux 3.4 can enqueue a layout notification while destroying a zoomed
+    # window, leaving a callback referring to freed memory. Unzoom in separate
+    # client requests while the session still owns its windows. The snapshot
+    # already contains the original zoom state and is not changed here.
+    layout_state=$(tmux list-windows -t "$target" -F '#{window_id} #{window_zoomed_flag}') || return
+    while read -r window zoomed; do
+        [[ -n $window ]] || continue
+        if [[ $zoomed == 1 ]]; then
+            tmux resize-pane -Z -t "$window" || return
+        fi
+    done <<< "$layout_state"
+    tmux kill-session -t "$target"
+}
+# End safe session teardown
 cleanup() {
     local status=$?
     trap - EXIT
@@ -102,7 +144,7 @@ cleanup() {
         fi
     fi
     if (( status != 0 )) && [[ -n $created ]]; then
-        tmux kill-session -t "$created" 2>/dev/null || :
+        kill_session_safely "$created" 2>/dev/null || :
     fi
     exit "$status"
 }
@@ -189,10 +231,10 @@ if [[ $mode == list || $mode == __complete ]]; then
     # One tmux request for all live sessions/panes, regardless of snapshot count.
     declare -A live=() live_codex=() groups=() foregrounds=() children_by_pid=() emitted=()
     live_rows=
-    if [[ $mode != list || $name != --names ]]; then
+    if [[ $mode != list || $name != --names || $sort_by == status || $sort_by == codex ]]; then
         live_rows=$(tmux list-panes -a -F $'#{session_name}\t#{pane_current_command}\t#{pane_pid}' 2>/dev/null || :)
     fi
-    if [[ $mode == list && $name != --names && -n $live_rows ]]; then
+    if [[ $mode == list && ( $name != --names || $sort_by == codex ) && -n $live_rows ]]; then
         # One process-table snapshot also covers wrapped/renamed Codex clients.
         while read -r process parent group foreground_group; do
             groups[$process]=$group foregrounds[$process]=$foreground_group
@@ -202,7 +244,7 @@ if [[ $mode == list || $mode == __complete ]]; then
     while IFS=$'\t' read -r live_name foreground pid; do
         [[ -n $live_name ]] || continue
         live[$live_name]=1
-        [[ $mode == list && $name != --names ]] || continue
+        [[ $mode == list && ( $name != --names || $sort_by == codex ) ]] || continue
         [[ ${live_codex[$live_name]-} != yes ]] || continue
         codex=no
         if [[ $foreground == codex || $foreground == codex-* ]]; then
@@ -230,7 +272,6 @@ if [[ $mode == list || $mode == __complete ]]; then
             printf '%s\n' "$saved_name"; emitted[$saved_name]=1
             continue
         fi
-        if [[ $name == --names ]]; then printf '%s\n' "$saved_name"; continue; fi
         status=hibernated
         [[ -f $snapshot/windows ]] || status='not saved'
         codex=no
@@ -245,16 +286,43 @@ if [[ $mode == list || $mode == __complete ]]; then
         if [[ $name != wake ]]; then
             for live_name in "${!live[@]}"; do [[ -n ${emitted[$live_name]-} ]] || printf '%s\n' "$live_name"; done
         fi
-    elif [[ $name != --names ]]; then
-        if [[ $name == --tsv ]]; then
-            for i in "${!names[@]}"; do printf '%s\t%s\t%s\t%s\n' "${names[i]}" "${statuses[i]}" "${codex_states[i]}" "${timestamps[i]}"; done
+    else
+        order=()
+        if ((${#names[@]})); then
+            epochs=()
+            if [[ $sort_by == hibe ]]; then
+                # Parse offsets in one date invocation, so chronological order
+                # remains correct across time zones and daylight-saving changes.
+                mapfile -t epochs < <(date -f <(
+                    for stamp in "${timestamps[@]}"; do
+                        if [[ $stamp == - ]]; then printf '1970-01-01 UTC\n'; else printf '%s\n' "$stamp"; fi
+                    done
+                ) +%s)
+            fi
+            mapfile -t sorted_rows < <(
+                for i in "${!names[@]}"; do
+                    rank=0 epoch=0
+                    case $sort_by in
+                        hibe) [[ ${timestamps[i]} == - ]] || rank=1; epoch=${epochs[i]:-0} ;;
+                        status) case ${statuses[i]} in running) rank=0;; hibernated) rank=1;; *) rank=2;; esac ;;
+                        codex) case ${codex_states[i]} in no) rank=0;; yes) rank=1;; resume) rank=2;; *) rank=3;; esac ;;
+                    esac
+                    printf '%s\t%s\t%s\t%s\n' "$rank" "$epoch" "${names[i]}" "$i"
+                done | sort -t $'\t' -k1,1n -k2,2n -k3,3f -k3,3 -k4,4n
+            )
+            for row in "${sorted_rows[@]}"; do order+=("${row##*$'\t'}"); done
+        fi
+        if [[ $name == --names ]]; then
+            for i in "${order[@]}"; do printf '%s\n' "${names[i]}"; done
+        elif [[ $name == --tsv ]]; then
+            for i in "${order[@]}"; do printf '%s\t%s\t%s\t%s\n' "${names[i]}" "${statuses[i]}" "${codex_states[i]}" "${timestamps[i]}"; done
         elif ((${#names[@]} == 0)); then
             printf 'No tmux-sess sessions. Start one with: tmux-sess new NAME\n'
         else
             width=7
             for saved_name in "${names[@]}"; do ((${#saved_name} <= width)) || width=${#saved_name}; done
             printf '%-*s  %-10s  %-7s  %s\n' "$width" SESSION STATUS CODEX 'LAST HIBERNATED'
-            for i in "${!names[@]}"; do printf '%-*s  %-10s  %-7s  %s\n' "$width" "${names[i]}" "${statuses[i]}" "${codex_states[i]}" "${timestamps[i]}"; done
+            for i in "${order[@]}"; do printf '%-*s  %-10s  %-7s  %s\n' "$width" "${names[i]}" "${statuses[i]}" "${codex_states[i]}" "${timestamps[i]}"; done
         fi
     fi
     exit 0
@@ -395,7 +463,7 @@ if [[ $mode == hibe ]]; then
     fi
     mv -T -- "$stage" "$dest"; stage=
     if [[ -n $backup ]]; then rm -rf -- "$backup"; backup=; fi
-    tmux kill-session -t "$sid"
+    kill_session_safely "$sid"
     printf 'Hibernated %q: %s\n' "$name" "$dest"
 else
     [[ -z $sid ]] || fail 'A live session already has that name'

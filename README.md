@@ -47,6 +47,7 @@ You can also hibernate an existing tmux session that was created manually.
 | `list` | Show known sessions, Codex status, and last hibernation time. |
 | `list --tsv` | Print four tab-separated fields without a heading. |
 | `list --names` | Print known session names only. |
+| `list --sort KEY` | Sort by `hibe` (default), `name`, `status`, or `codex`. |
 | `wd DIRECTORY` | Save the parent directory for new projects. |
 | `wd` | Show the effective project directory. |
 | `completion bash` | Print Bash completion setup. |
@@ -80,6 +81,19 @@ another     hibernated  resume   2026-10-22T18:10:00+02:00
 The list includes sessions registered by `new` or saved with `hibe`. Ordinary
 unregistered tmux sessions are excluded. Listing batches live pane information
 into one tmux query and one process-table scan.
+
+By default, unavailable hibernation times come first, followed by oldest to newest
+(latest last). Timestamps are compared chronologically, including UTC offsets.
+Choose another order with:
+
+```bash
+./tmux-sess list --sort name    # alphabetical, ignoring case
+./tmux-sess list --sort status  # running, hibernated, not saved
+./tmux-sess list --sort codex   # no, yes, resume, unknown
+```
+
+Ties are sorted alphabetically by session name. Sort options also work with
+`--tsv` and `--names`, in either argument order.
 
 ### Bash completion
 
@@ -151,6 +165,9 @@ recovery; the next successful hibernation replaces it. A failed save preserves
 the previous snapshot and live session. A failed wake removes its partial
 session and retains the snapshot.
 
+After saving, zoomed windows are unzoomed before being closed to avoid a tmux 3.4
+teardown crash. The snapshot retains the zoom state for the next wake.
+
 ## Limitations
 
 This restores a workspace rather than checkpointing processes. Interactive shell
@@ -174,6 +191,7 @@ Tests that work without a tmux socket:
 ```bash
 bash tests/dispatch.sh
 bash tests/list-completion.sh
+bash tests/safe-teardown.sh
 bash tests/process-detection.sh  # requires gcc
 ```
 
