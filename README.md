@@ -1,48 +1,68 @@
 # tmux-sess
 
-To import the inspected older prototype format, run `./migrate-prototype`.
-It reads `~/.local/state/tmux-sess-proto` and installs into the current state
-directory without changing the originals or overwriting existing snapshots.
-Optional arguments select source and destination directories. Blank prototype
-names are inferred from directory names with their trailing numeric IDs removed.
-Missing shell histories become empty; Codex auto-resume is disabled. Layouts,
-directories, output and pane selection are retained. Hibernation times use the
-prototype completion-file modification times. Each import includes a
-`migration-notes` file documenting unavailable metadata.
+Hibernate individual tmux sessions and restore them later, including pane layouts,
+working directories, shell history, and scrollback. Codex conversations can be
+closed when hibernating and resumed when waking.
 
-Hibernate an individual tmux session, closing its panes and removing it from
-`tmux list-sessions`. Wake recreates the session detached.
+`tmux-sess` is a standalone Bash script. Hibernated sessions disappear from tmux;
+waking creates fresh shells with the saved state.
 
-```bash
-./tmux-sess new my-session
-./tmux-sess hibe my-session
-./tmux-sess wake my-session
-./tmux-sess list
-tmux attach-session -t '=my-session'
-```
+## Requirements
 
-`new NAME` creates `~/data/dev/NAME` if needed, opens one tmux window with two
-stacked Bash panes in that directory, and starts `codex` in the upper pane. It
-attaches from a terminal, or switches clients when run inside tmux. Without a
-terminal it leaves the session detached. An existing live session is attached;
-an existing snapshot is woken and attached. Project files are never removed.
-Names for new projects must not contain slashes, dots, colons or newlines.
-Set a different project parent once per machine:
+- Linux, Bash 4.4+, and tmux (developed against tmux 3.4).
+- Standard utilities including `flock`, `sha256sum`, `readlink`, `ps`, and `date`.
+- Codex CLI on your `PATH` for creating Codex workspaces and resuming conversations.
+
+## Quick start
+
+Run from the repository directory:
 
 ```bash
+chmod +x tmux-sess
+
+# Choose an existing directory for your projects (default: ~/data/dev).
 ./tmux-sess wd ~/projects
-./tmux-sess wd                  # show the effective directory
-./tmux-sess new my-project      # creates ~/projects/my-project
+
+# Create ~/projects/my-project, open two stacked panes, and start Codex above.
+./tmux-sess new my-project
 ```
 
-The directory must already exist. Relative paths and paths with spaces work;
-the setting is stored as an absolute path in the state directory. It affects
-future new projects; existing sessions and snapshots keep their directories.
-`TMUX_SESS_DEV_HOME`, when set, overrides the saved setting. Without either,
-the default is `~/data/dev`. Completion also offers directories for `wd`.
+From **another terminal or tmux session**:
 
-`list` prints an aligned table with session name, status (`hibernated`, `running`,
-or `not saved`), Codex status, and last hibernation time:
+```bash
+./tmux-sess hibe my-project   # save and close the session
+./tmux-sess list              # inspect saved sessions
+./tmux-sess new my-project    # wake and attach
+```
+
+You can also hibernate an existing tmux session that was created manually.
+
+## Commands
+
+| Command | Behavior |
+| --- | --- |
+| `new NAME` | Create a two-pane Codex workspace, wake a saved session, or attach to a running session. |
+| `hibe NAME` | Save and close one session, replacing its previous snapshot. |
+| `wake NAME` | Restore a saved session detached. |
+| `list` | Show known sessions, Codex status, and last hibernation time. |
+| `list --tsv` | Print four tab-separated fields without a heading. |
+| `list --names` | Print known session names only. |
+| `wd DIRECTORY` | Save the parent directory for new projects. |
+| `wd` | Show the effective project directory. |
+| `completion bash` | Print Bash completion setup. |
+| `-h`, `--help` | Show detailed help. |
+
+`new` attaches from a terminal, switches clients when run inside tmux, and leaves
+the session detached when no terminal is available. It never removes project
+files. New project names cannot contain slashes, dots, colons, or newlines.
+
+To attach after `wake`:
+
+```bash
+tmux attach-session -t '=my-project'
+```
+
+### Session list
 
 ```text
 SESSION     STATUS      CODEX    LAST HIBERNATED
@@ -50,99 +70,116 @@ my-project  running     yes      2026-10-23T14:30:00+02:00
 another     hibernated  resume   2026-10-22T18:10:00+02:00
 ```
 
-CODEX is `yes` for a detected running Codex process, `resume` for a hibernated
-conversation saved for wake, `no` when none is detected, or `unknown` when a live
-process cannot be inspected. Listing uses one tmux request for all live panes
-and one process-table scan, rather than querying each saved session separately.
-`list --tsv` returns four tab-separated fields without a heading for scripts;
-`list --names` returns just known names without contacting tmux.
+- **Status:** `running`, `hibernated`, or `not saved` if a registered session
+  disappeared before being hibernated.
+- **Codex:** `yes` when running, `resume` when saved for wake, `no` when none is
+  detected, or `unknown` when a live process cannot be inspected.
+- **Last hibernated:** an ISO 8601 timestamp with its UTC offset, or `-` when
+  unavailable. Waking keeps this timestamp; hibernating again updates it.
 
-The timestamp uses
-ISO 8601 with the local UTC offset, for example `2026-10-23T14:30:00+02:00`.
-It remains visible after waking and updates on the next hibernation. `-` means
-the session has never been hibernated or its snapshot predates timestamp support.
-`new` registers sessions immediately. `not saved`
-means a registered session disappeared before it was hibernated. Ordinary tmux
-sessions without snapshots or registration are excluded. With no known sessions,
-`list` prints a short hint; `--tsv` and `--names` produce no output.
+The list includes sessions registered by `new` or saved with `hibe`. Ordinary
+unregistered tmux sessions are excluded. Listing batches live pane information
+into one tmux query and one process-table scan.
 
-Enable Bash completion in the current shell:
+### Bash completion
+
+Enable completion in the current shell:
 
 ```bash
 eval "$(./tmux-sess completion bash)"
 ```
 
-Add that line (using the script's absolute path) to `~/.bashrc` for future shells.
-Tab completes commands, flags, and names with spaces. `hibe` offers live sessions,
-including ordinary tmux sessions that can be saved; `wake` offers hibernated
-snapshots; `new` offers known and live names. Prefix matching takes priority,
-with substring matching as a fallback. Use `./tmux-sess -h` or `--help` for
-command descriptions, examples, settings and restore limitations.
+For future shells, add the same command to `~/.bashrc` using the script's absolute
+path. Completion supports commands, flags, directory paths, and session names
+with spaces. It offers live sessions for `hibe`, hibernated sessions for `wake`,
+and both for `new`. Prefix matches take priority, with substring matching as a
+fallback.
 
-Requires Bash 4.4+, tmux (written against 3.4), and standard Linux utilities
-including `flock` and `sha256sum`. `tmux-sess` is a standalone Bash script. Run from another terminal or session:
-hibernating the session containing this command would also terminate the saver.
+## What gets restored
 
-Before hibernating, leave **shell panes at empty Bash prompts**, with all
-foreground programs other than Codex and background/stopped jobs finished. Run
-`hibe` from another session or terminal. Codex panes must have been launched from
-an interactive Bash shell, rather than replacing it with `exec codex`.
+| State | Restored? |
+| --- | --- |
+| Window names and indices | Yes |
+| Pane layout, sizes, selection, and zoom | Yes |
+| Working directory in each pane | Yes |
+| Per-pane Bash history | Yes |
+| Screen and available scrollback, including text colors | Replayed in ordinary shell panes |
+| Codex conversation | Resumed using its saved conversation ID |
+| Running programs and in-memory shell state | No |
 
-The saver first validates all panes, then sends Ctrl-C to Codex (at most twice),
-waits for it to exit to Bash, and records the UUID from its printed
-`codex resume UUID` command. An active Codex turn may be interrupted. The ID comes
-from output logged during this exit, never from `resume --last` or another
-conversation. If exit or ID capture fails, hibernation stops with the tmux
-session alive. Codex may already have closed; consult its exit message. This
-relies on the CLI's exit footer. Detection checks the foreground process name
-and, on Linux, the foreground process tree's executable paths (including the
-npm Node launcher), so renamed process titles are supported. Unsupported wrappers
-or changed footer formatting fail conservatively.
+For Codex panes, shell history is restored and `codex resume UUID` redraws the
+conversation. The old screen is archived in the snapshot but not replayed,
+including any output from commands previously run outside Codex in that pane.
 
-On wake, Codex panes restore shell history and run `codex resume UUID`. Their
-saved screen remains in the snapshot's pane `screen` file but is not replayed,
-so Codex can redraw its conversation without duplicate output. This also means
-outside-Codex shell output in those panes is archived rather than displayed.
-Ordinary panes restore their screen and shell history as before. Codex's own
-saved conversation must still exist; the tmux snapshot does not back it up or
-save CLI flags, model overrides, or remote-server connection settings.
+## Before hibernating
 
-The saver sends a history export command to each Bash prompt. Do not type in
-those panes while saving. It refuses other foreground programs, jobs it can
-detect, and windows linked into other sessions. Prompt detection cannot reliably distinguish a shell prompt
-from Bash's `read` builtin or an unfinished command: you must check this yourself.
+- Run `hibe` from another terminal or session.
+- Leave shell panes at **empty Bash prompts**, with background and stopped jobs
+  finished. Do not type into the panes while saving.
+- Launch Codex from interactive Bash so closing it returns to the shell;
+  avoid `exec codex`.
 
-Saved state includes window names and indices, pane layout and sizes, selected
-window/pane, zoom, working directories, per-pane Bash history, and the screen
-plus available tmux scrollback (including text colors). Saving completes before
-`kill-session` runs. Other sessions are left running.
+Hibernation validates panes, closes Codex with Ctrl-C (at most twice), and records
+its resume ID from the exit message. An active Codex turn may be interrupted.
+If Codex does not exit or its ID cannot be captured, hibernation stops and leaves
+the tmux session alive, although Codex may already have closed. Unsupported
+foreground programs and windows shared with other sessions are refused.
 
-This recreates shells; it is not process checkpointing. Other running applications,
-shell variables/functions defined interactively, virtualenv activation, shell
-options, process IDs, and terminal cursor state are not restored. Bash startup
-files run again. Scrollback is replayed as text, followed by a fresh prompt;
-expect an extra prompt and possible wrapping differences. Output tmux has already
-discarded cannot be recovered. Set tmux's `history-limit` high enough *before*
-waking to retain all replayed output. Custom `.bashrc` history or prompt hooks may
-change the restored history. Session-specific tmux options, bindings, hooks, and
-client attachments are not saved.
+Prompt detection cannot distinguish every Bash builtin or unfinished command
+from an idle prompt. Check that shell panes are ready before saving.
 
-Snapshots live under `${XDG_STATE_HOME:-~/.local/state}/tmux-sess`, or the directory
-specified by `TMUX_SESS_HOME`. Each session uses a SHA-256 directory name and a
-`name` file containing its original name. Files are created privately and may
-contain sensitive output and commands. The state directory must be trusted.
+## Configuration and storage
 
-Wake retains the snapshot for recovery. Hibernating again replaces it only after
-the new save completes. A failed save keeps the previous snapshot and leaves the
-live session alive, although history export commands may already have run in
-some panes. A failed wake removes its partial session and keeps the saved state.
+```bash
+./tmux-sess wd ~/projects
+./tmux-sess wd
+```
 
-For an isolated integration check, run `bash tests/integration.sh`. It starts
-its own tmux server and does not touch your default server.
-`bash tests/codex-integration.sh` tests the Codex lifecycle using a local fake
-CLI (requires gcc; no API calls). `bash tests/dispatch.sh` checks new-session
-dispatch with a mock tmux and works without socket access.
-`bash tests/process-detection.sh` checks renamed Codex process detection on Linux
-(requires gcc; no tmux socket or API calls).
-`bash tests/list-completion.sh` tests list formatting, batched queries, Codex
-status, help and completion without a real tmux server.
+The directory must already exist. Relative paths and paths with spaces are
+supported; the setting is saved as an absolute path. It affects new projects,
+while existing sessions and snapshots keep their directories.
+
+| Setting | Purpose | Default |
+| --- | --- | --- |
+| Saved `wd` | Parent directory for new projects | `~/data/dev` |
+| `TMUX_SESS_DEV_HOME` | Override the saved project directory | Unset |
+| `TMUX_SESS_HOME` | Override the snapshot and settings directory | `${XDG_STATE_HOME:-~/.local/state}/tmux-sess` |
+
+Snapshots use private permissions and can contain sensitive output and command
+history. Keep the state directory trusted. Waking retains the snapshot for
+recovery; the next successful hibernation replaces it. A failed save preserves
+the previous snapshot and live session. A failed wake removes its partial
+session and retains the snapshot.
+
+## Limitations
+
+This restores a workspace rather than checkpointing processes. Interactive shell
+variables and functions, virtual environments, shell options, process IDs, and
+exact cursor state are not preserved. Bash startup files run again and custom
+history or prompt hooks may affect restoration.
+
+Replayed output may wrap differently and ends with a fresh prompt. Output tmux
+has already discarded cannot be recovered. Set tmux's `history-limit` high enough
+before waking to retain the replayed scrollback. Session-specific tmux options,
+bindings, hooks, and attached clients are not saved.
+
+Codex restoration depends on its exit-message format and its own saved
+conversation remaining available. Snapshots do not back up Codex conversations
+or preserve CLI flags, model overrides, or remote-server settings.
+
+## Tests
+
+Tests that work without a tmux socket:
+
+```bash
+bash tests/dispatch.sh
+bash tests/list-completion.sh
+bash tests/process-detection.sh  # requires gcc
+```
+
+Integration tests start an isolated tmux server:
+
+```bash
+bash tests/integration.sh
+bash tests/codex-integration.sh # requires gcc; uses a fake CLI, no API calls
+```
