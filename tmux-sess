@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# Hibernate and wake individual idle Bash tmux sessions.
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+fail() { printf 'tmux-sess: %s\n' "$*" >&2; exit 1; }
+help() {
+    cat <<'HELP'
+Usage: tmux-sess COMMAND [SESSION|DIRECTORY]
+
+  new NAME         Create WORKDIR/NAME, two stacked Bash panes, Codex above.
+                   Attach if running; wake and attach if already hibernated.
+  hibe NAME        Close Codex, save layout/output/history/directories, then
+                   remove the tmux session. Replaces its previous snapshot.
+  wake NAME        Restore detached; resume Codex by its saved conversation ID.
+  list             Show known sessions, live Codex status and last hibernation.
+  list --tsv       Tab-separated rows without headings (for scripts).
+  list --names     Known session names only.
+  wd DIRECTORY     Save the project parent directory for future new sessions.
+  wd               Show the effective project parent directory.
+  completion bash  Print Bash completion setup.
+  -h, --help       Show this help.
+
+Examples:
+  ./tmux-sess wd ~/projects
+  ./tmux-sess new my-project
+  ./tmux-sess hibe my-project
+  ./tmux-sess wake my-project
+  eval "$(./tmux-sess completion bash)"
+
+Completion: commands and context-aware session names; prefix matches first,
+then substring matches. Add the eval command to ~/.bashrc to enable each shell.
+
+Run hibe from another terminal/session. Shell panes must be at empty Bash
+prompts without jobs. Codex must return to Bash when closed. Codex turns may
+be interrupted. Its old screen is archived; other panes replay saved output.
+Shell variables and other running applications are not checkpointed.
+
+List CODEX: yes = running now; resume = saved for wake; no = none;
+unknown = the live process could not be inspected. '-' means no timestamp.
+
+Environment:
+  TMUX_SESS_DEV_HOME  Override saved wd (fallback when unset: ~/data/dev).
+  TMUX_SESS_HOME      Snapshot directory (default: $XDG_STATE_HOME/tmux-sess,
+                     or ~/.local/state/tmux-sess).
+HELP
+}
+if [[ ${1-} == -h || ${1-} == --help || ${2-} == -h || ${2-} == --help ]]; then help; exit 0; fi
+if [[ ${1-} == completion && ${2-} == bash && $# == 2 ]]; then
+    printf '_tmux_sess_executable=%q\n' "$(readlink -f -- "${BASH_SOURCE[0]}")"
+    cat <<'COMPLETION'
+_tmux_sess_complete() {
+    local current=${COMP_WORDS[COMP_CWORD]} candidate action=${COMP_WORDS[1]-}
+    local -a candidates=() fallback=()
+    COMPREPLY=()
+    if (( COMP_CWORD == 1 )); then
+        candidates=(new hibe wake list wd completion --help)
+    elif (( COMP_CWORD == 2 )); then
+        case $action in
+            new|hibe|wake) mapfile -t candidates < <("$_tmux_sess_executable" __complete "$action" 2>/dev/null) ;;
+            list) candidates=(--tsv --names --help) ;;
+            completion) candidates=(bash) ;;
+            wd)
+                mapfile -t COMPREPLY < <(compgen -d -- "$current")
+                for candidate in "${!COMPREPLY[@]}"; do COMPREPLY[candidate]+=/; done
+                compopt -o filenames -o nospace 2>/dev/null || :
+                return 0 ;;
+        esac
+    fi
+    for candidate in "${candidates[@]}"; do
+        if [[ $candidate == "$current"* ]]; then COMPREPLY+=("$candidate");
+        elif [[ $candidate == *"$current"* ]]; then fallback+=("$candidate"); fi
+    done
+    ((${#COMPREPLY[@]})) || COMPREPLY=("${fallback[@]}")
+    return 0
+}
+complete -F _tmux_sess_complete tmux-sess ./tmux-sess "$_tmux_sess_executable"
+COMPLETION
+    exit 0
+fi
+[[ ( $# == 1 && ( $1 == list || $1 == wd ) ) || ( $# == 2 && ( $1 == hibe || $1 == wake || $1 == new || $1 == wd || ( $1 == list && ( $2 == --tsv || $2 == --names ) ) || ( $1 == __complete && ( $2 == new || $2 == hibe || $2 == wake ) ) ) ) ]] || fail 'Use tmux-sess -h for usage.'
+for tool in tmux sha256sum flock mktemp date; do command -v "$tool" >/dev/null || fail "Missing command: $tool"; done
+mode=$1 name=${2-}
+root=${TMUX_SESS_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-sess}
+mkdir -p -- "$root"
+root=$(cd -- "$root" && pwd -P)
+key=$(printf %s "$name" | sha256sum); key=${key%% *}
+dest=$root/$key
+exec 9>"$root/.lock"
+if [[ $mode == list || $mode == __complete ]]; then flock -s 9; else flock -x 9; fi
+stage= created= backup= piping= attach=0
+cleanup() {
+    local status=$?
+    trap - EXIT
+    [[ -z $piping ]] || tmux pipe-pane -t "$piping" 2>/dev/null || :
+    [[ -z $stage ]] || rm -rf -- "$stage"
+    if [[ -n $backup && -d $backup ]]; then
+        if [[ ! -e $dest ]]; then
+            mv -T -- "$backup" "$dest" || printf 'Previous snapshot retained at: %s\n' "$backup" >&2
+        else
+            printf 'Previous snapshot retained at: %s\n' "$backup" >&2
+        fi
+    fi
+    if (( status != 0 )) && [[ -n $created ]]; then
+        tmux kill-session -t "$created" 2>/dev/null || :
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+project_parent=${TMUX_SESS_DEV_HOME:-}
+if [[ -z $project_parent && -f $root/workdir ]]; then project_parent=$(< "$root/workdir"); fi
+project_parent=${project_parent:-$HOME/data/dev}
+if [[ $mode == wd ]]; then
+    if [[ $# == 1 ]]; then
+        printf '%s\n' "$project_parent"
+    else
+        [[ -d $name ]] || fail "Not a directory: $name"
+        workdir=$(cd -- "$name" && pwd -P)
+        stage=$(mktemp "$root/.workdir-XXXXXXXX")
+        printf '%s\n' "$workdir" > "$stage"
+        mv -T -- "$stage" "$root/workdir"; stage=
+        printf 'Project directory set to: %s\n' "$workdir"
+    fi
+    exit 0
+fi
+# Query fields separately: names, titles and paths may contain tabs.
+field() { tmux display-message -p -t "$1" "#{${2}}"; }
+# Linux process names can be changed or truncated. Recognize the executable,
+# and the npm Node launcher, rather than relying solely on pane_current_command.
+is_codex_process() {
+    local process=$1 executable argument
+    executable=$(readlink -- "/proc/$process/exe" 2>/dev/null) || return 1
+    executable=${executable% (deleted)}
+    case ${executable##*/} in
+        codex|codex-* ) return 0 ;;
+        node|nodejs)
+            local -a arguments=()
+            mapfile -d '' -t arguments < "/proc/$process/cmdline" 2>/dev/null || return 1
+            # Only inspect the launcher argument, not arbitrary user prompts.
+            argument=${arguments[1]-}
+            [[ $argument == */codex || $argument == */codex.js ]] ;;
+        *) return 1 ;;
+    esac
+}
+pane_is_codex() {
+    local pane=$1 foreground root process group foreground_group child children
+    foreground=$(field "$pane" pane_current_command)
+    [[ $foreground != codex && $foreground != codex-* ]] || return 0
+    root=$(field "$pane" pane_pid)
+    foreground_group=$(ps -o tpgid= -p "$root" 2>/dev/null) || return 1
+    foreground_group=${foreground_group//[[:space:]]/}
+    [[ $foreground_group =~ ^[0-9]+$ && $foreground_group -gt 0 ]] || return 1
+    local -a queue=("$root")
+    while ((${#queue[@]})); do
+        process=${queue[0]}; queue=("${queue[@]:1}")
+        group=$(ps -o pgid= -p "$process" 2>/dev/null) || continue
+        group=${group//[[:space:]]/}
+        if [[ $group == "$foreground_group" ]] && is_codex_process "$process"; then return 0; fi
+        children=/proc/$process/task/$process/children
+        if [[ -r $children ]]; then
+            for child in $(cat -- "$children"); do queue+=("$child"); done
+        fi
+    done
+    return 1
+}
+# End process detection
+find_session() {
+    local id
+    while IFS= read -r id; do
+        if [[ $(field "$id" session_name) == "$name" ]]; then printf %s "$id"; return; fi
+    done < <(tmux list-sessions -F '#{session_id}' 2>/dev/null || :)
+}
+attach_session() {
+    # Do not hold the state lock for the lifetime of the attached client.
+    created=
+    flock -u 9
+    exec 9>&-
+    if [[ -n ${TMUX:-} ]]; then
+        tmux switch-client -t "$sid"
+    elif [[ -t 0 && -t 1 ]]; then
+        tmux attach-session -t "$sid"
+    else
+        printf 'Session ready. Attach with: tmux attach-session -t %q\n' "=$name"
+    fi
+}
+if [[ $mode == list || $mode == __complete ]]; then
+    # One tmux request for all live sessions/panes, regardless of snapshot count.
+    declare -A live=() live_codex=() groups=() foregrounds=() children_by_pid=() emitted=()
+    live_rows=
+    if [[ $mode != list || $name != --names ]]; then
+        live_rows=$(tmux list-panes -a -F $'#{session_name}\t#{pane_current_command}\t#{pane_pid}' 2>/dev/null || :)
+    fi
+    if [[ $mode == list && $name != --names && -n $live_rows ]]; then
+        # One process-table snapshot also covers wrapped/renamed Codex clients.
+        while read -r process parent group foreground_group; do
+            groups[$process]=$group foregrounds[$process]=$foreground_group
+            children_by_pid[$parent]+=" $process"
+        done < <(ps -eo pid=,ppid=,pgid=,tpgid=)
+    fi
+    while IFS=$'\t' read -r live_name foreground pid; do
+        [[ -n $live_name ]] || continue
+        live[$live_name]=1
+        [[ $mode == list && $name != --names ]] || continue
+        [[ ${live_codex[$live_name]-} != yes ]] || continue
+        codex=no
+        if [[ $foreground == codex || $foreground == codex-* ]]; then
+            codex=yes
+        elif [[ -z ${foregrounds[$pid]-} ]]; then
+            codex=unknown
+        else
+            queue=("$pid")
+            while ((${#queue[@]})); do
+                process=${queue[0]}; queue=("${queue[@]:1}")
+                if [[ ${groups[$process]-} == "${foregrounds[$pid]}" ]] && is_codex_process "$process"; then codex=yes; break; fi
+                for child in ${children_by_pid[$process]-}; do queue+=("$child"); done
+            done
+        fi
+        if [[ $codex == yes || ${live_codex[$live_name]-no} != unknown ]]; then live_codex[$live_name]=$codex; fi
+    done <<< "$live_rows"
+    shopt -s nullglob
+    names=() statuses=() codex_states=() timestamps=()
+    for snapshot in "$root"/*; do
+        [[ -d $snapshot && -f $snapshot/version && -f $snapshot/name ]] || continue
+        [[ $(< "$snapshot/version") == 1 ]] || continue
+        saved_name=$(< "$snapshot/name")
+        if [[ $mode == __complete ]]; then
+            if [[ $name == hibe && -z ${live[$saved_name]-} ]] || [[ $name == wake && ( -n ${live[$saved_name]-} || ! -f $snapshot/windows ) ]]; then continue; fi
+            printf '%s\n' "$saved_name"; emitted[$saved_name]=1
+            continue
+        fi
+        if [[ $name == --names ]]; then printf '%s\n' "$saved_name"; continue; fi
+        status=hibernated
+        [[ -f $snapshot/windows ]] || status='not saved'
+        codex=no
+        saved_ids=("$snapshot"/*/*/codex-id)
+        ((${#saved_ids[@]} == 0)) || codex=resume
+        if [[ -n ${live[$saved_name]-} ]]; then status=running; codex=${live_codex[$saved_name]-unknown}; fi
+        hibernated_at=-
+        if [[ -f $snapshot/hibernated-at ]]; then hibernated_at=$(< "$snapshot/hibernated-at"); fi
+        names+=("$saved_name") statuses+=("$status") codex_states+=("$codex") timestamps+=("$hibernated_at")
+    done
+    if [[ $mode == __complete ]]; then
+        if [[ $name != wake ]]; then
+            for live_name in "${!live[@]}"; do [[ -n ${emitted[$live_name]-} ]] || printf '%s\n' "$live_name"; done
+        fi
+    elif [[ $name != --names ]]; then
+        if [[ $name == --tsv ]]; then
+            for i in "${!names[@]}"; do printf '%s\t%s\t%s\t%s\n' "${names[i]}" "${statuses[i]}" "${codex_states[i]}" "${timestamps[i]}"; done
+        elif ((${#names[@]} == 0)); then
+            printf 'No tmux-sess sessions. Start one with: tmux-sess new NAME\n'
+        else
+            width=7
+            for saved_name in "${names[@]}"; do ((${#saved_name} <= width)) || width=${#saved_name}; done
+            printf '%-*s  %-10s  %-7s  %s\n' "$width" SESSION STATUS CODEX 'LAST HIBERNATED'
+            for i in "${!names[@]}"; do printf '%-*s  %-10s  %-7s  %s\n' "$width" "${names[i]}" "${statuses[i]}" "${codex_states[i]}" "${timestamps[i]}"; done
+        fi
+    fi
+    exit 0
+fi
+sid=$(find_session)
+if [[ $mode == new ]]; then
+    if [[ -n $sid ]]; then
+        attach_session
+        exit 0
+    elif [[ -f $dest/windows ]]; then
+        mode=wake attach=1
+    else
+        # Restrict project names to one safe directory component.
+        [[ -n $name && $name != . && $name != .. && $name != */* && $name != *:* && $name != *.* && $name != *$'\n'* ]] || fail 'Use a nonempty session name without slashes, dots, colons or newlines'
+        command -v codex >/dev/null || fail 'codex is not on PATH'
+        project=$project_parent/$name
+        mkdir -p -- "$project"
+        project=$(cd -- "$project" && pwd -P)
+        result=$(tmux new-session -d -P -F '#{session_id} #{pane_id}' -s "$name" -c "$project" 'bash -i')
+        read -r created upper <<< "$result"
+        sid=$created
+        tmux split-window -v -d -t "$upper" -c "$project" 'bash -i'
+        tmux select-pane -t "$upper"
+        # Starting from Bash keeps the original shell/history after Codex exits.
+        tmux send-keys -t "$upper" -l 'codex'
+        tmux send-keys -t "$upper" Enter
+        mkdir -p -- "$dest"
+        printf '1\n' > "$dest/version"
+        printf %s "$name" > "$dest/name"
+        attach_session
+        exit 0
+    fi
+fi
+if [[ $mode == hibe ]]; then
+    [[ -n $sid ]] || fail 'No live session with that exact name'
+    stage=$(mktemp -d "$root/.saving-XXXXXXXX")
+    declare -A codex_panes=()
+    # Validate every pane before closing Codex or sending shell commands.
+    mapfile -t windows < <(tmux list-windows -t "$sid" -F '#{window_id}')
+    ((${#windows[@]})) || fail 'No windows found'
+    for w in "${windows[@]}"; do
+        [[ $(field "$w" window_linked) != 1 ]] || fail 'Unlink shared windows first'
+        mapfile -t panes < <(tmux list-panes -t "$w" -F '#{pane_id}')
+        for p in "${panes[@]}"; do
+            foreground=$(field "$p" pane_current_command)
+            if pane_is_codex "$p"; then
+                [[ $(field "$p" pane_pipe) == 0 ]] || fail "$p already has a pipe-pane logger"
+                codex_panes[$p]=1
+                continue
+            fi
+            [[ $foreground == bash ]] || fail "$p is not at a Bash prompt or running Codex (tmux reports: $foreground; pane PID: $(field "$p" pane_pid))"
+            pending=$(tmux show-options -p -v -t "$p" @tmux_sess_codex_id 2>/dev/null || :)
+            if [[ -n $pending ]]; then codex_panes[$p]=$pending; fi
+            pid=$(field "$p" pane_pid)
+            children=/proc/$pid/task/$pid/children
+            if [[ -r $children && -n $(cat -- "$children") ]]; then fail "$p has child processes; stop its jobs first"; fi
+        done
+    done
+    for p in "${!codex_panes[@]}"; do
+        if [[ ${codex_panes[$p]} != 1 ]]; then
+            tmux capture-pane -p -e -S - -t "$p" > "$stage/codex-${p#%}.screen"
+            continue
+        fi
+        # Log only this exit, so an older resume footer cannot supply a stale ID.
+        tmux capture-pane -p -e -S - -t "$p" > "$stage/codex-${p#%}.screen"
+        printf -v pipe_command 'cat > %q' "$stage/codex-${p#%}.exit"
+        tmux pipe-pane -O -t "$p" "$pipe_command"
+        piping=$p
+        tmux send-keys -t "$p" C-c
+        sleep .5
+        if pane_is_codex "$p"; then tmux send-keys -t "$p" C-c; fi
+        for ((i=0; i<200; i++)); do
+            [[ $(field "$p" pane_current_command) != bash ]] || break
+            sleep .05
+        done
+        [[ $(field "$p" pane_current_command) == bash ]] || fail "Codex in $p did not exit to Bash; session kept alive"
+        # Wait for the pipe consumer to drain the final resume footer.
+        resume_id=
+        for ((i=0; i<40; i++)); do
+            if [[ -f $stage/codex-${p#%}.exit ]]; then
+                exit_text=$(cat -- "$stage/codex-${p#%}.exit")
+                if [[ $exit_text =~ codex[[:space:]]+resume[[:space:]]+([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}) ]]; then
+                    resume_id=${BASH_REMATCH[1]}; break
+                fi
+            fi
+            sleep .05
+        done
+        tmux pipe-pane -t "$p"; piping=
+        [[ -n $resume_id ]] || fail "Codex exited in $p without a readable resume ID; session kept alive (see its exit message)"
+        codex_panes[$p]=$resume_id
+        # A later export failure must not lose the ID when hibe is retried.
+        tmux set-option -p -t "$p" @tmux_sess_codex_id "$resume_id"
+    done
+    printf '%s\n' 1 > "$stage/version"
+    printf %s "$name" > "$stage/name"
+    printf '%s\n' "${windows[@]}" > "$stage/windows"
+    for w in "${windows[@]}"; do
+        wd=$stage/${w#@}; mkdir -- "$wd"
+        for f in window_index window_name window_layout window_width window_height window_active window_zoomed_flag; do
+            field "$w" "$f" > "$wd/$f"
+        done
+        tmux list-panes -t "$w" -F '#{pane_id}' > "$wd/panes"
+        while IFS= read -r p; do
+            pd=$wd/${p#%}; mkdir -- "$pd"
+            for f in pane_current_path pane_active pane_title; do field "$p" "$f" > "$pd/$f"; done
+            if [[ -n ${codex_panes[$p]-} ]]; then
+                printf '%s\n' "${codex_panes[$p]}" > "$pd/codex-id"
+                mv -- "$stage/codex-${p#%}.screen" "$pd/screen"
+            else
+                tmux capture-pane -p -e -S - -t "$p" > "$pd/screen"
+            fi
+            printf -v histq %q "$pd/history"
+            printf -v doneq %q "$pd/done"
+            cmd=" if [[ -z \$(jobs -p) ]]; then builtin history -w $histq && printf ok > $doneq; else printf busy > $doneq; fi"
+            tmux send-keys -t "$p" -l "$cmd"
+            tmux send-keys -t "$p" Enter
+            for ((i=0; i<160; i++)); do [[ ! -f $pd/done ]] || break; sleep .05; done
+            [[ -f $pd/done && $(cat -- "$pd/done") == ok ]] || fail "Cannot export $p; use an empty Bash prompt with no jobs"
+            # Remove the export command when HISTCONTROL did not exclude it.
+            mapfile -t history_lines < "$pd/history"
+            count=${#history_lines[@]}
+            if ((count)) && [[ ${history_lines[count-1]} == "$cmd" ]]; then
+                unset 'history_lines[count-1]'; count=$((count-1))
+                if ((count)) && [[ ${history_lines[count-1]} =~ ^#[0-9]+$ ]]; then unset 'history_lines[count-1]'; fi
+                : > "$pd/history"
+                if ((${#history_lines[@]})); then printf '%s\n' "${history_lines[@]}" > "$pd/history"; fi
+            fi
+            rm -- "$pd/done"
+        done < "$wd/panes"
+    done
+    # Keep the previous snapshot until the complete replacement is installed.
+    # The lock prevents other tmux-sess commands observing the rename gap.
+    date -Iseconds > "$stage/hibernated-at"
+    if [[ -e $dest ]]; then
+        backup=$(mktemp -d "$root/.previous-XXXXXXXX")
+        rmdir -- "$backup"
+        mv -T -- "$dest" "$backup"
+    fi
+    mv -T -- "$stage" "$dest"; stage=
+    if [[ -n $backup ]]; then rm -rf -- "$backup"; backup=; fi
+    tmux kill-session -t "$sid"
+    printf 'Hibernated %q: %s\n' "$name" "$dest"
+else
+    [[ -z $sid ]] || fail 'A live session already has that name'
+    [[ -f $dest/version && $(cat -- "$dest/version") == 1 ]] || fail 'Missing or unsupported snapshot'
+    [[ $(cat -- "$dest/name") == "$name" ]] || fail 'Snapshot name mismatch'
+    mapfile -t windows < "$dest/windows"
+    for w in "${windows[@]}"; do
+        wd=$dest/${w#@}
+        while IFS= read -r p; do
+            pd=$wd/${p#%}; cwd=$(cat -- "$pd/pane_current_path")
+            if [[ -f $pd/codex-id ]]; then command -v codex >/dev/null || fail 'codex is not on PATH'; fi
+            [[ -d $cwd ]] || fail "Directory no longer exists: $cwd"
+            rm -f -- "$pd/ready"
+        done < "$wd/panes"
+    done
+    active_window=
+    for w in "${windows[@]}"; do
+        wd=$dest/${w#@}
+        index=$(cat -- "$wd/window_index")
+        width=$(cat -- "$wd/window_width"); height=$(cat -- "$wd/window_height")
+        unset ids; declare -A ids=()
+        first=1 active=
+        while IFS= read -r p; do
+            pd=$wd/${p#%}; cwd=$(cat -- "$pd/pane_current_path")
+            {
+                printf '[ ! -f ~/.bashrc ] || source ~/.bashrc\n'
+                printf 'while [[ ! -f %q ]]; do sleep .05; done\n' "$pd/ready"
+                printf 'builtin cd -- %q\n' "$cwd"
+                printf 'builtin history -c\nbuiltin history -r %q\n' "$pd/history"
+                if [[ -f $pd/codex-id ]]; then
+                    printf 'codex resume %q\n' "$(cat -- "$pd/codex-id")"
+                else
+                    printf 'command cat -- %q\n' "$pd/screen"
+                fi
+            } > "$pd/bashrc"
+            printf -v command 'exec bash --rcfile %q -i' "$pd/bashrc"
+            if [[ -z $created ]]; then
+                result=$(tmux new-session -d -P -F '#{session_id} #{window_id} #{pane_id}' -s "$name" -x "$width" -y "$height" -c "$cwd" "$command")
+                read -r created wid pid <<< "$result"
+                if [[ $(field "$wid" window_index) != "$index" ]]; then tmux move-window -s "$wid" -t "$created:$index"; fi
+            elif ((first)); then
+                result=$(tmux new-window -d -P -F '#{window_id} #{pane_id}' -t "$created:$index" -c "$cwd" "$command")
+                read -r wid pid <<< "$result"
+            else
+                pid=$(tmux split-window -d -P -F '#{pane_id}' -t "$wid" -c "$cwd" "$command")
+                tmux select-layout -t "$wid" tiled >/dev/null
+            fi
+            first=0; ids[${p#%}]=${pid#%}
+            tmux select-pane -t "$pid" -T "$(cat -- "$pd/pane_title")"
+            if [[ $(cat -- "$pd/pane_active") == 1 ]]; then active=$pid; fi
+        done < "$wd/panes"
+        tmux set-window-option -t "$wid" automatic-rename off
+        tmux rename-window -t "$wid" "$(cat -- "$wd/window_name")"
+        tmux resize-window -t "$wid" -x "$width" -y "$height"
+        # Replace only leaf IDs in the saved layout, then recalculate tmux's checksum.
+        layout=$(cat -- "$wd/window_layout"); rest=${layout#*,}; body=
+        while [[ $rest =~ ([0-9]+x[0-9]+,[0-9]+,[0-9]+,)([0-9]+) ]]; do
+            match=${BASH_REMATCH[0]} prefix=${BASH_REMATCH[1]} old=${BASH_REMATCH[2]}
+            body+=${rest%%"$match"*}$prefix${ids[$old]}
+            rest=${rest#*"$match"}
+        done
+        body+=$rest; checksum=0
+        for ((i=0; i<${#body}; i++)); do
+            printf -v byte %d "'${body:i:1}"
+            checksum=$(( (((checksum >> 1) | ((checksum & 1) << 15)) + byte) & 65535 ))
+        done
+        printf -v layout '%04x,%s' "$checksum" "$body"
+        tmux select-layout -t "$wid" "$layout" >/dev/null
+        tmux select-pane -t "$active"
+        if [[ $(cat -- "$wd/window_zoomed_flag") == 1 ]]; then tmux resize-pane -Z -t "$active"; fi
+        if [[ $(cat -- "$wd/window_active") == 1 ]]; then active_window=$wid; fi
+    done
+    tmux select-window -t "$active_window"
+    for w in "${windows[@]}"; do
+        wd=$dest/${w#@}
+        while IFS= read -r p; do touch -- "$wd/${p#%}/ready"; done < "$wd/panes"
+    done
+    printf 'Restored %q. Attach with: tmux attach-session -t %q\n' "$name" "=$name"
+    if ((attach)); then sid=$created; attach_session; fi
+fi
